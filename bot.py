@@ -1,7 +1,6 @@
 import os
 import logging
-import psycopg2
-from psycopg2.extras import RealDictCursor
+import asyncpg
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
@@ -11,85 +10,59 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Railway environment variables
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 DATABASE_URL = os.environ.get("DATABASE_URL")
 
-
-def get_db():
-    """PostgreSQL bağlantısı aç"""
-    return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
+db_pool = None
 
 
-def init_db():
-    """Cədvəli yarat (əgər yoxdursa)"""
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS group_stats (
-            chat_id     BIGINT PRIMARY KEY,
-            chat_title  TEXT,
-            msg_count   BIGINT DEFAULT 0
-        )
-    """)
-    conn.commit()
-    cur.close()
-    conn.close()
+async def init_db():
+    global db_pool
+    db_pool = await asyncpg.create_pool(DATABASE_URL)
+    async with db_pool.acquire() as conn:
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS group_stats (
+                chat_id     BIGINT PRIMARY KEY,
+                chat_title  TEXT,
+                msg_count   BIGINT DEFAULT 0
+            )
+        """)
     logger.info("✅ DB hazırdır")
 
 
-def increment_count(chat_id: int, chat_title: str):
-    """Mesaj sayını 1 artır, qrup yoxdursa yarat"""
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("""
-        INSERT INTO group_stats (chat_id, chat_title, msg_count)
-        VALUES (%s, %s, 1)
-        ON CONFLICT (chat_id) DO UPDATE
-        SET msg_count  = group_stats.msg_count + 1,
-            chat_title = EXCLUDED.chat_title
-    """, (chat_id, chat_title))
-    conn.commit()
-    cur.close()
-    conn.close()
+async def increment_count(chat_id: int, chat_title: str):
+    async with db_pool.acquire() as conn:
+        await conn.execute("""
+            INSERT INTO group_stats (chat_id, chat_title, msg_count)
+            VALUES ($1, $2, 1)
+            ON CONFLICT (chat_id) DO UPDATE
+            SET msg_count  = group_stats.msg_count + 1,
+                chat_title = EXCLUDED.chat_title
+        """, chat_id, chat_title)
 
 
-def get_stats(chat_id: int):
-    """Qrupun adını və mesaj sayını qaytar"""
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT chat_title, msg_count FROM group_stats WHERE chat_id = %s",
-        (chat_id,)
-    )
-    row = cur.fetchone()
-    cur.close()
-    conn.close()
-    return row  # {"chat_title": ..., "msg_count": ...} və ya None
+async def get_stats(chat_id: int):
+    async with db_pool.acquire() as conn:
+        return await conn.fetchrow(
+            "SELECT chat_title, msg_count FROM group_stats WHERE chat_id = $1",
+            chat_id
+        )
 
-
-# ── Komandalar ───────────────────────────────────────────────
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    /start - heç nə etmir
-    """
     pass
 
 
 async def stat(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    /stat - qrup adı 💬 + mesaj sayı
-    """
     chat = update.effective_chat
 
     if chat.type not in ["group", "supergroup"]:
-        await update.message.reply_text("⚠️ Bu komanda yalnız qruplarda işləyir.")
+        await update.message.reply_text("⚠️ Bu komut sadece gruplarda çalışır.")
         return
 
-    row = get_stats(chat.id)
+    row = await get_stats(chat.id)
     if not row:
-        await update.message.reply_text("Hələ heç bir mesaj qeydə alınmayıb.")
+        await update.message.reply_text("Şu ana Kadar Hiçbir Atılmadı.")
         return
 
     group_name = row["chat_title"] or chat.title or "Qrup"
@@ -99,23 +72,22 @@ async def stat(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def count_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Hər mesajı DB-yə yaz"""
     chat = update.effective_chat
     if chat and chat.type in ["group", "supergroup"]:
-        increment_count(chat.id, chat.title or "")
+        await increment_count(chat.id, chat.title or "")
 
 
-# ── Main ─────────────────────────────────────────────────────
+async def post_init(app: Application):
+    await init_db()
+
 
 def main():
     if not BOT_TOKEN:
-        raise ValueError("BOT_TOKEN environment variable tapılmadı!")
+        raise ValueError("BOT_TOKEN tapılmadı!")
     if not DATABASE_URL:
-        raise ValueError("DATABASE_URL environment variable tapılmadı!")
+        raise ValueError("DATABASE_URL tapılmadı!")
 
-    init_db()
-
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("stat", stat))
